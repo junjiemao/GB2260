@@ -6,33 +6,12 @@ from __future__ import print_function
 import os
 import re
 import sys
+import csv
 import itertools
 
 import requests
 from lxml.html import fromstring
 
-
-URL_BASE = 'http://www.stats.gov.cn/tjsj/tjbz/xzqhdm/'
-URL_LIST = [
-    # (year, url, is_mass)
-    (2014, '201504/t20150415_712722.html', False),
-    (2013, '201401/t20140116_501070.html', False),
-    (2012, '201301/t20130118_38316.html', False),
-    (2011, '201201/t20120105_38315.html', False),
-    (2010, '201107/t20110726_38314.html', False),
-    (2009, '201006/t20100623_38313.html', False),
-    (2008, '200906/t20090626_38312.html', False),
-    (2007, '200802/t20080215_38311.html', False),
-    (2006, '200704/t20070411_38310.html', False),
-    (2005, '200410/t20041022_38307.html', True),
-    (200506, '200410/t20041022_38306.html', True),
-    (2004, '200410/t20041022_38305.html', True),
-    (200409, '200410/t20041022_38304.html', True),
-    (200403, '200406/t20040607_38302.html', True),
-    (2003, '200402/t20040211_38301.html', True),
-    (200306, '200307/t20030722_38300.html', True),
-    (2002, '200302/t20030219_38299.html', True),
-]
 
 XPATH_EXPRS = [
     './/div[@class="xilan_con"]//tbody/tr',
@@ -40,6 +19,9 @@ XPATH_EXPRS = [
 ]
 XPATH_MASS_EXPRS = [
     './/p[@class="MsoNormal"]//span//text()',
+]
+XPATH_MCA_EXPRS = [
+    './/tr',
 ]
 
 
@@ -54,12 +36,31 @@ def strip_comments(line):
     return line.strip('*() \n\t\r').strip()
 
 
-def iter_lines(element, is_mass):
-    if is_mass:
-        for line in iter_lines_of_mass_document(element):
-            yield line
-        return
+def iter_lines(element, schema):
+    handlers = {
+        'stats': iter_lines_of_normal_document,
+        'stats-mass': iter_lines_of_mass_document,
+        'mca': iter_lines_of_mca_document,
+    }
+    assert schema in handlers, 'Schema not found'
+    handler = handlers[schema]
+    for line in handler(element):
+        yield line
 
+
+def iter_lines_of_mca_document(element):
+    for xpath in XPATH_MCA_EXPRS:
+        line_elements = element.xpath(xpath)
+        for el in line_elements:
+            fragments = el.xpath('.//text()')
+            if any(child.tag == 'br' for child in el.getchildren()):
+                for fragment in fragments:
+                    yield fragment
+            else:
+                yield u' '.join(fragments)
+
+
+def iter_lines_of_normal_document(element):
     for xpath in XPATH_EXPRS:
         line_elements = element.xpath(xpath)
         for el in line_elements:
@@ -89,20 +90,32 @@ def predict(iterable):
 
 
 def main():
-    if len(sys.argv) != 2:
-        print('Usage: %s [dir]' % sys.argv[0], file=sys.stderr)
+    if len(sys.argv) != 3:
+        print('Usage: %s [sources] [dir]' % sys.argv[0], file=sys.stderr)
         sys.exit(0)
 
-    for suffix, url, is_mass in URL_LIST:
-        req = requests.get(URL_BASE + url)
+    with open(sys.argv[1], 'r') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        url_list = [
+            (line['Source'], line['Revision'], line['URL'], line['Schema'])
+            for line in reader
+        ]
+
+    for source, revision, url, schema in url_list:
+        req = requests.get(url)
         req.encoding = 'utf-8'
         el = fromstring(req.text)
 
-        dirname = os.path.join(sys.argv[1], 'GB2260-%s.txt' % suffix)
-        print('--> %s' % dirname, file=sys.stderr)
+        dirname = os.path.join(sys.argv[2], source)
+        pathname = os.path.join(dirname, '%s.tsv' % revision)
+        print('--> %s' % pathname, file=sys.stderr)
 
-        with open(dirname, 'w') as dest_file:
-            for line in iter_lines(el, is_mass):
+        if not os.path.exists(dirname):
+            os.makedirs(dirname)
+
+        with open(pathname, 'w') as dest_file:
+            print(b'Source\tRevision\tCode\tName', file=dest_file)
+            for line in iter_lines(el, schema):
                 text = strip_spaces_in_chinese_words(strip_comments(line))
                 if not text:
                     continue
@@ -113,7 +126,7 @@ def main():
                 except ValueError:
                     print('ignored: %s' % text, file=sys.stderr)
                 else:
-                    out = '%s\t%s' % (code, name)
+                    out = '%s\t%s\t%s\t%s' % (source, revision, code, name)
                     print(out.encode('utf-8'), file=dest_file)
 
 
